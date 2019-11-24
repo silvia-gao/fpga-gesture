@@ -1,0 +1,206 @@
+from pynq.overlays.base import BaseOverlay
+from pynq.lib.video import *
+
+base = BaseOverlay("base.bit")
+hdmi_in = base.video.hdmi_in 
+hdmi_out = base.video.hdmi_out
+
+Mode = VideoMode(640,480,24) 
+hdmi_out = base.video.hdmi_out 
+hdmi_out.configure(Mode,PIXEL_BGR) 
+hdmi_out.start() 
+
+# 图像输出配置
+frame_out_w = 1920 
+frame_out_h = 1080 
+
+# 图像输入配置
+frame_in_w = 640 
+frame_in_h = 480
+
+import cv2
+import math
+videoIn = cv2.VideoCapture(0) # 0代表本机自带摄像头
+videoIn.set(cv2.CAP_PROP_FRAME_WIDTH, frame_in_w);
+videoIn.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_in_h);
+
+print("Capture device is open: " + str(videoIn.isOpened())) 
+#在 HDMI 输出上显示输入帧
+
+
+import numpy as np
+import time
+#各变量的定义
+count = 0
+cxcnt = 0
+cxcnt1 = 0
+cxcnt2 = 0
+cxrm = [0,0,0,0,0,0,0,0,0,0,0]#储存当前横坐标信息
+stable = 0
+gesture = [0,0,0,0,0,0,0,0,0,0,0]#储存当前手势信息
+gscnt = 0
+gscnt1 = 0
+gscnt2 = 0
+
+ledpos = 0
+
+t = 20
+ti = 0.01
+camera = videoIn
+#开始读取图像、处理图像以及显示图像
+while camera.isOpened():
+    ret, frame = camera.read()# 读取摄像头的数据 frame为画面 ret 为标识
+
+    frame = cv2.bilateralFilter(frame, 5, 50, 100)  # 双边滤波
+    frame = cv2.flip(frame, 1)  # 图片翻转   Y轴翻转
+    #去除背景噪声
+    bgModel = cv2.createBackgroundSubtractorMOG2()
+    fgmask = bgModel.apply(frame) # 提取前景
+
+    #进行开闭运算去除毛刺与孤立点
+    kernel = np.ones((3, 3), np.uint8)
+    fgmask = cv2.morphologyEx(fgmask,cv2.MORPH_OPEN,kernel)
+    fgmask = cv2.morphologyEx(fgmask,cv2.MORPH_CLOSE,kernel)
+
+
+
+    # 肤色检测: YCrCb之Cr分量 + OTSU二值化
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb) # 分解为YUV图像,得到CR分量
+    (_, cr, cb) = cv2.split(ycrcb)
+
+    #Otsu阈值划分法 速度快
+    cr1 = cv2.GaussianBlur(cr, (5, 5), 0) # 高斯滤波
+    _, skin = cv2.threshold(cr1, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  # OTSU图像二值化
+    _,contours, _ = cv2.findContours(skin, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+
+
+    #运动物体检测并以矩形框标识
+    maxArea = 0
+    mx = 0
+    mw = 0
+    for c in contours:
+        Area = cv2.contourArea(c)
+        if Area < maxArea :
+            (x, y, w, h) = (0,0,0,0)
+            continue
+        else:
+            if Area < 5000:  #选择范围以排除较小物体的干扰
+                (x, y, w, h) = (0,0,0,0)
+                continue
+            else:
+                maxArea = Area
+                m = c
+                (x, y, w, h) = cv2.boundingRect(m)
+                mx = x
+                mw = w
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+    cnt = max(contours, key = lambda x: cv2.contourArea(x))#取轮廓中面积最大的一个，再次排除手之外的物体干扰
+
+    hull = cv2.convexHull(cnt,returnPoints = False)  # 寻找凸包
+    defects = cv2.convexityDefects(cnt, hull)   # 凸缺陷检测
+    #计算手指个数
+    cnt1 = 0
+    if t != 20:
+        for i in range(defects.shape[0]):  # 计算角度
+            s, e, f, d = defects[i][0]
+            start = tuple(cnt[s][0])
+            end = tuple(cnt[e][0])
+            far = tuple(cnt[f][0])
+            a = math.sqrt((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2)
+            b = math.sqrt((far[0] - start[0]) ** 2 + (far[1] - start[1]) ** 2)
+            c = math.sqrt((end[0] - far[0]) ** 2 + (end[1] - far[1]) ** 2)
+            angle = math.acos((b ** 2 + c ** 2 - a ** 2) / (2 * b * c))  # 余弦定理
+            if angle <= math.pi / 2:  # 小于九十度角的判断为手指
+                cnt1 += 1
+    #计算静矩                
+    M = cv2.moments(cnt)
+    t = t + 1
+    #进入判断
+    if ((M['m00'] > 0) & (t >= 20)) :
+        #计算质心坐标
+        cx = int(M['m10']/M['m00'])
+        cy = int(M['m01']/M['m00'])
+        #每十次有效位移进行一次判断
+        if (count < 10):
+            #单帧位移大于50认为是有效位移，否则清零数组
+            if cx - cxcnt2 > 50:
+                count = count + 1
+                cxrm[count] = cx
+                gesture = [0,0,0,0,0,0,0,0,0,0,0]
+            elif cxcnt2 - cx >= 50:
+                count = count + 1
+                cxrm[count] = cx
+                gesture = [0,0,0,0,0,0,0,0,0,0,0]
+            elif cx - cxcnt2 <= 50 & cxcnt2 - cx < 50:
+                count = 0
+                cxrm = [0,0,0,0,0,0,0,0,0,0,0]
+                for ii in range(0,10):
+                    gesture[ii] = gesture[ii + 1] 
+                gesture[10] = gscnt2 - cnt1
+            #缓存数据
+            cxcnt2 = cxcnt1
+            cxcnt1 = cxcnt
+            cxcnt = cx    
+            gscnt2 = gscnt1
+            gscnt1 = gscnt
+            gscnt = cnt1
+
+            print(gesture)
+            sj1 = 0
+            sj2 = 0
+            for i1 in range(0,10):
+                if gesture[i1] >= 2:
+                    sj1 = sj1 + 1
+                elif gesture[i1] <= -2:
+                    sj2 = sj2 + 1
+            #手指数量变化连续两帧大于2时判断为手势变化
+            if sj1 >= 2:
+                print('stop')
+                
+                for aa in range(0,3):
+                    base.leds[aa].off()
+                
+                t = 0
+                gesture = [0,0,0,0,0,0,0,0,0,0,0]
+            elif sj2 >= 2:
+                print('play')
+                
+                ledpos = 0
+                base.leds[ledpos].on()
+                ledpos = 1
+                base.leds[ledpos].on()
+
+                t = 0
+                gesture = [0,0,0,0,0,0,0,0,0,0,0]
+            sj1 = 0
+            sj2 = 0
+            
+        elif count == 10:
+            print(1)
+            #连续位移有效且总位移大于一定量时识别为移动
+            if sum(cxrm[1:5]) - sum(cxrm[6:10]) >= 300:
+                print('left')
+                for cc in range(0,3):
+                    base.leds[cc].off()
+                
+                ledpos = 1
+                base.leds[ledpos].on()
+
+                print(cxrm)
+                t = 0
+            elif sum(cxrm[1:5]) - sum(cxrm[6:10]) <= -300:
+                print('right')
+                for dd in range(0,3):
+                    base.leds[dd].off()
+                
+                ledpos = 0
+                base.leds[ledpos].on()
+                print(cxrm)
+                t = 0
+            count = 0
+            cxrm = [0,0,0,0,0,0,0,0,0,0,0]
+            gesture = [0,0,0,0,0,0,0,0,0,0,0]
+    #HDMI输出带有运动物体识别的实时图像
+    outframe = hdmi_out.newframe()
+    outframe[0:480,0:640,:] = frame[0:480,0:640,:] 
+    hdmi_out.writeframe(outframe) 
